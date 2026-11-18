@@ -1,10 +1,13 @@
 import logging
 import sys
+
 import structlog
+
 from app.config import settings
 
+
 def setup_logging():
-    # Setup processors for structlog
+    level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
@@ -14,29 +17,19 @@ def setup_logging():
     ]
 
     if settings.APP_ENV == "production":
-        # JSON formatting in production
-        processors = shared_processors + [
-            structlog.processors.dict_tracebacks,
-            structlog.processors.JSONRenderer(),
-        ]
+        processors = shared_processors + [structlog.processors.dict_tracebacks, structlog.processors.JSONRenderer()]
     else:
-        # Dev-friendly console rendering
-        processors = shared_processors + [
-            structlog.dev.ConsoleRenderer()
-        ]
+        processors = shared_processors + [structlog.dev.ConsoleRenderer()]
 
     structlog.configure(
         processors=processors,
+        # Drops events below LOG_LEVEL before any formatting work is done.
+        wrapper_class=structlog.make_filtering_bound_logger(level),
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
+    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
 
-    # Configure stdlib logging if needed to redirect to structlog
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
-        level=logging.INFO if settings.APP_ENV == "production" else logging.DEBUG,
-    )
 
 setup_logging()
 logger = structlog.get_logger()

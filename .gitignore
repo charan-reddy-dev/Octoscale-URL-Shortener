@@ -68,3 +68,7 @@ active_env/
 .env
 .env.*
 !.env.example
+
+# Local benchmark databases
+*.sqlite3*
+

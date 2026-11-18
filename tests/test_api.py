@@ -1,5 +1,8 @@
 import pytest
 from fastapi import status
+from redis.exceptions import ConnectionError as RedisConnectionError
+
+from app.clicks import click_recorder
 
 @pytest.mark.asyncio
 async def test_shorten_endpoint_success(client):
@@ -20,7 +23,7 @@ async def test_shorten_endpoint_validation_error(client):
         "/api/v1/shorten",
         json={"original_url": "invalid-url-string"}
     )
-    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    assert response.status_code == 422
 
 @pytest.mark.asyncio
 async def test_shorten_endpoint_custom_code(client):
@@ -64,6 +67,7 @@ async def test_analytics_endpoint(client):
     
     # Hit redirect to create click data
     await client.get("/netflx", headers={"user-agent": "Mozilla", "referer": "https://google.com"})
+    await click_recorder.flush()
 
     # Fetch analytics
     response = await client.get("/api/v1/analytics/netflx")
@@ -94,8 +98,8 @@ async def test_health_check_database_down(client, mocker):
     assert "down" in data["detail"]["components"]["database"]
 
 @pytest.mark.asyncio
-async def test_health_check_redis_down(client, mocker):
-    mocker.patch("tests.conftest.MockRedis.ping", side_effect=Exception("Redis Down"))
+async def test_health_check_redis_down(client, mocker, mock_redis):
+    mocker.patch.object(mock_redis, "ping", side_effect=Exception("Redis Down"))
     response = await client.get("/api/v1/health")
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     data = response.json()
@@ -103,13 +107,14 @@ async def test_health_check_redis_down(client, mocker):
     assert "down" in data["detail"]["components"]["redis"]
 
 @pytest.mark.asyncio
-async def test_rate_limiter_fail_open(client, mocker):
-    mocker.patch("tests.conftest.MockRedis.pipeline", side_effect=Exception("Redis Pipeline Down"))
+async def test_rate_limiter_falls_back_when_redis_fails(client, mocker, mock_redis):
+    mocker.patch.object(mock_redis, "evalsha", side_effect=RedisConnectionError("Redis down"))
     response = await client.post(
         "/api/v1/shorten",
         json={"original_url": "https://google.com"}
     )
     assert response.status_code == status.HTTP_201_CREATED
+    assert response.headers["X-RateLimit-Backend"] == "memory"
 
 @pytest.mark.asyncio
 async def test_redirect_not_found_renders_html(client):
