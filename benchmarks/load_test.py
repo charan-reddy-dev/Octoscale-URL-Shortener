@@ -162,8 +162,10 @@ def run_phase(base_url: str, kind: str, payload: dict, concurrency: int, process
 # ---------------------------------------------------------------- setup and limiter checks (main process)
 
 
-async def setup_urls(base_url: str, n: int) -> list[str]:
+async def setup_urls(base_url: str, n: int) -> tuple[list[str], int]:
+    """Create n links, then warm the cache with one redirect each. Returns (codes, warm-up 307 count)."""
     codes: list[str] = []
+    warm_redirects = 0
     sem = asyncio.Semaphore(32)
     async with make_client(base_url, 32) as client:
 
@@ -180,8 +182,43 @@ async def setup_urls(base_url: str, n: int) -> list[str]:
         await asyncio.gather(*(create(i) for i in range(n)))
         # Warm the cache and connection pools; not measured.
         for i, code in enumerate(codes):
-            await client.get(f"/{code}", headers={"X-Forwarded-For": client_ip(70_000 + i)})
-    return codes
+            r = await client.get(f"/{code}", headers={"X-Forwarded-For": client_ip(70_000 + i)})
+            warm_redirects += r.status_code == 307
+    return codes, warm_redirects
+
+
+# ---------------------------------------------------------------- data integrity (optional, needs DB access)
+
+
+async def db_counts(db_url: str) -> dict:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(db_url)
+    try:
+        async with engine.connect() as conn:
+            row = (await conn.execute(text(
+                "SELECT (SELECT count(*) FROM urls), (SELECT count(DISTINCT short_code) FROM urls), "
+                "(SELECT count(*) FROM click_analytics), (SELECT coalesce(sum(clicks), 0) FROM urls)"
+            ))).one()
+    finally:
+        await engine.dispose()
+    return {"url_rows": row[0], "distinct_short_codes": row[1], "click_rows": row[2], "click_counter_sum": int(row[3])}
+
+
+async def wait_for_clicks(db_url: str, expected_click_rows: int, timeout_s: float = 60) -> dict:
+    """Clicks are written asynchronously in batches; wait until the expected rows land or stop growing."""
+    deadline = time.perf_counter() + timeout_s
+    last, stable = None, 0
+    while True:
+        counts = await db_counts(db_url)
+        if counts["click_rows"] >= expected_click_rows or time.perf_counter() > deadline:
+            return counts
+        stable = stable + 1 if counts == last else 0
+        if stable >= 5:
+            return counts
+        last = counts
+        await asyncio.sleep(1)
 
 
 async def limiter_burst(base_url: str, route: str, code: str, limit: int, concurrency: int) -> dict:
@@ -292,6 +329,9 @@ def main() -> None:
     p.add_argument("--redis-url", default=None, help="optional: read the Redis server version for metadata")
     p.add_argument("--notes", default=None)
     p.add_argument("--same-host", action="store_true", help="load generator and server share the machine")
+    p.add_argument("--verify-db-url", default=None,
+                   help="optional SQLAlchemy async URL of the server's database; checks every 201 became a URL row "
+                        "and every 307 became a click row")
     p.add_argument("--output", default="benchmarks/results.json")
     args = p.parse_args()
 
@@ -302,9 +342,10 @@ def main() -> None:
         import redis
 
         redis_version = redis.Redis.from_url(args.redis_url, protocol=2).info("server").get("redis_version")
+    before = asyncio.run(db_counts(args.verify_db_url)) if args.verify_db_url else None
 
     print(f"setup: creating {args.urls} links ...", flush=True)
-    codes = asyncio.run(setup_urls(args.base_url, args.urls))
+    codes, warm_redirects = asyncio.run(setup_urls(args.base_url, args.urls))
 
     print(f"redirect: {args.duration}s at concurrency {args.concurrency} ...", flush=True)
     redirect = run_phase(args.base_url, "redirect", {"codes": codes, "clients": args.clients},
@@ -319,6 +360,24 @@ def main() -> None:
         asyncio.run(limiter_burst(args.base_url, "redirect", codes[0], args.redirect_limit, 64)),
         asyncio.run(limiter_burst(args.base_url, "api", codes[0], args.api_limit, 64)),
     ]
+
+    integrity = None
+    if args.verify_db_url:
+        print("integrity: waiting for batched click writes ...", flush=True)
+        expected_urls = len(codes) + create["status_counts"].get("201", 0) + limiter[1]["allowed"]
+        expected_clicks = warm_redirects + redirect["status_counts"].get("307", 0) + limiter[0]["allowed"]
+        after = asyncio.run(wait_for_clicks(args.verify_db_url, before["click_rows"] + expected_clicks))
+        delta = {k: after[k] - before[k] for k in after}
+        integrity = {
+            "expected_new_url_rows": expected_urls,
+            "new_url_rows": delta["url_rows"],
+            "duplicate_short_codes": after["url_rows"] - after["distinct_short_codes"],
+            "expected_new_click_rows": expected_clicks,
+            "new_click_rows": delta["click_rows"],
+            "click_counter_increase": delta["click_counter_sum"],
+            "urls_consistent": delta["url_rows"] == expected_urls and after["url_rows"] == after["distinct_short_codes"],
+            "clicks_consistent": delta["click_rows"] == expected_clicks == delta["click_counter_sum"],
+        }
 
     result = {
         "benchmark": "octoscale-load-test",
@@ -339,6 +398,7 @@ def main() -> None:
         "environment": environment(args, health, redis_version),
         "scenarios": {"redirect": redirect, "create": create},
         "rate_limiter": limiter,
+        "data_integrity": integrity,
     }
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
@@ -351,6 +411,10 @@ def main() -> None:
               f"p99 {lat['p99_ms']} ms  errors {s['error_rate']:.4%}")
     for lim in limiter:
         print(f"limiter   {lim['route']:8} limit {lim['limit_per_window']}  allowed {lim['allowed']}  429 {lim['rejected_429']}  exact={lim['exact']}")
+    if integrity:
+        print(f"integrity urls {integrity['new_url_rows']}/{integrity['expected_new_url_rows']}  "
+              f"clicks {integrity['new_click_rows']}/{integrity['expected_new_click_rows']}  "
+              f"dupes {integrity['duplicate_short_codes']}  ok={integrity['urls_consistent'] and integrity['clicks_consistent']}")
     print(f"wrote {args.output}")
 
 

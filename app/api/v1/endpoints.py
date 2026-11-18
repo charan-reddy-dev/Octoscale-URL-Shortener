@@ -1,3 +1,5 @@
+import os
+
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
@@ -61,7 +63,7 @@ async def get_url_analytics(short_code: str, service: URLService = Depends(get_u
 @router.get("/health", status_code=status.HTTP_200_OK)
 async def health_check(db: AsyncSession = Depends(get_db), redis_client: aioredis.Redis = Depends(get_redis)):
     """Check database and Redis connectivity. Not rate limited, so load balancers can poll it."""
-    health = {"status": "healthy", "components": {}, "clicks_pending": click_recorder.pending}
+    health = {"status": "healthy", "components": {}, "worker_pid": os.getpid(), "clicks": click_recorder.stats()}
 
     try:
         await db.execute(text("SELECT 1"))

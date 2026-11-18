@@ -132,3 +132,35 @@ async def test_clicks_are_written_in_batches(client):
     data = (await client.get("/api/v1/analytics/clicks")).json()
     assert data["clicks"] == 5
     assert len(data["recent_clicks"]) == 5
+
+
+async def test_failed_click_batch_is_retried_not_dropped(client, mocker):
+    await client.post("/api/v1/shorten", json={"original_url": "https://example.com/d", "custom_code": "retry"})
+    for _ in range(3):
+        await client.get("/retry")
+    real_write = click_recorder._write
+    mocker.patch.object(click_recorder, "_write", side_effect=[RuntimeError("deadlock detected"), real_write])
+    dropped_before = click_recorder.dropped
+
+    assert await click_recorder.flush() == 0
+    assert click_recorder.pending == 3
+    mocker.patch.object(click_recorder, "_write", side_effect=real_write)
+    assert await click_recorder.flush() == 3
+    assert click_recorder.dropped == dropped_before
+    assert (await client.get("/api/v1/analytics/retry")).json()["clicks"] == 3
+
+
+async def test_click_batch_is_dropped_after_max_attempts(client, mocker):
+    await client.post("/api/v1/shorten", json={"original_url": "https://example.com/e", "custom_code": "giveup"})
+    await client.get("/giveup")
+    mocker.patch.object(click_recorder, "_write", side_effect=RuntimeError("db down"))
+    dropped_before = click_recorder.dropped
+    for _ in range(3):
+        await click_recorder.flush()
+    assert click_recorder.pending == 0
+    assert click_recorder.dropped == dropped_before + 1
+
+
+async def test_health_reports_click_writer_stats(client):
+    data = (await client.get("/api/v1/health")).json()
+    assert set(data["clicks"]) == {"pending", "written", "retried", "dropped"}
