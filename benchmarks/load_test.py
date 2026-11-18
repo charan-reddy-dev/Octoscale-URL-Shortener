@@ -80,8 +80,11 @@ def summarize(latencies_ms: list[float], statuses: Counter, errors: int, elapsed
     }
 
 
+KEEPALIVE_EXPIRY_S = 2.0  # below uvicorn's 5 s keep-alive timeout, so the client never reuses a socket the server is closing
+
+
 def make_client(base_url: str, connections: int) -> httpx.AsyncClient:
-    limits = httpx.Limits(max_connections=connections, max_keepalive_connections=connections)
+    limits = httpx.Limits(max_connections=connections, max_keepalive_connections=connections, keepalive_expiry=KEEPALIVE_EXPIRY_S)
     return httpx.AsyncClient(base_url=base_url, limits=limits, timeout=httpx.Timeout(10.0), follow_redirects=False)
 
 
@@ -330,6 +333,8 @@ def main() -> None:
             "processes": args.processes,
             "simulated_clients": args.clients,
             "setup_urls": args.urls,
+            "client_keepalive_expiry_s": KEEPALIVE_EXPIRY_S,
+            "client_timeout_s": 10.0,
         },
         "environment": environment(args, health, redis_version),
         "scenarios": {"redirect": redirect, "create": create},
