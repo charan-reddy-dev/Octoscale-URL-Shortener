@@ -1,0 +1,139 @@
+{
+  "benchmark": "octoscale-load-test",
+  "version": 1,
+  "started_at_utc": "2026-11-18T13:06:55+00:00",
+  "git_commit": "58e5618",
+  "command": "python benchmarks/load_test.py --base-url http://127.0.0.1:8000 --duration 30 --create-duration 15 --concurrency 128 --processes 6 --clients 20000 --urls 1000 --server-workers 6 --database PostgreSQL 18.7 (local) --redis-url redis://127.0.0.1:6379/0 --verify-db-url postgresql+asyncpg://postgres@127.0.0.1:5433/url_shortener --same-host --notes uvicorn 6 workers, LOG_LEVEL=warning, TRUST_PROXY_HEADERS=true, Redis persistence off --output benchmarks/results.json",
+  "config": {
+    "duration_s": 30.0,
+    "create_duration_s": 15.0,
+    "concurrency": 128,
+    "processes": 6,
+    "simulated_clients": 20000,
+    "setup_urls": 1000,
+    "client_keepalive_expiry_s": 2.0,
+    "client_timeout_s": 10.0
+  },
+  "environment": {
+    "os": "Windows-11-10.0.26200-SP0",
+    "cpu_model": "Intel(R) Core(TM) Ultra 5 235",
+    "cpu_logical_cores": 14,
+    "python": "3.14.7",
+    "httpx": "0.28.1",
+    "client_and_server_on_same_host": true,
+    "cpu_physical_cores": 14,
+    "memory_gb": 63.7,
+    "server": {
+      "workers": 6,
+      "database": "PostgreSQL 18.7 (local)",
+      "redis_version": "5.0.14.1",
+      "notes": "uvicorn 6 workers, LOG_LEVEL=warning, TRUST_PROXY_HEADERS=true, Redis persistence off",
+      "health": {
+        "status": "healthy",
+        "components": {
+          "database": "up",
+          "redis": "up"
+        },
+        "worker_pid": 47008,
+        "clicks": {
+          "pending": 0,
+          "written": 0,
+          "retried": 0,
+          "dropped": 0
+        }
+      }
+    }
+  },
+  "scenarios": {
+    "redirect": {
+      "requests": 72128,
+      "duration_s": 29.993,
+      "requests_per_second": 2404.8,
+      "latency_ms": {
+        "p50_ms": 37.005,
+        "p95_ms": 144.428,
+        "p99_ms": 219.874,
+        "max_ms": 614.367,
+        "mean_ms": 52.284
+      },
+      "status_counts": {
+        "307": 72128
+      },
+      "transport_errors": 0,
+      "error_rate": 0.0,
+      "expected_statuses": [
+        307
+      ],
+      "transport_error_types": {},
+      "concurrency": 126,
+      "processes": 6,
+      "wall_clock_s_including_process_start": 30.436
+    },
+    "create": {
+      "requests": 17378,
+      "duration_s": 15.035,
+      "requests_per_second": 1155.8,
+      "latency_ms": {
+        "p50_ms": 73.909,
+        "p95_ms": 318.08,
+        "p99_ms": 629.644,
+        "max_ms": 2994.277,
+        "mean_ms": 108.184
+      },
+      "status_counts": {
+        "201": 17378
+      },
+      "transport_errors": 0,
+      "error_rate": 0.0,
+      "expected_statuses": [
+        201
+      ],
+      "transport_error_types": {},
+      "concurrency": 126,
+      "processes": 6,
+      "wall_clock_s_including_process_start": 15.437
+    }
+  },
+  "rate_limiter": [
+    {
+      "route": "redirect",
+      "limit_per_window": 600,
+      "requests_sent": 1800,
+      "allowed": 600,
+      "rejected_429": 1200,
+      "other_statuses": {},
+      "accuracy": 1.0,
+      "exact": true,
+      "429_with_retry_after": 1200,
+      "limiter_backend": {
+        "redis": 1800
+      },
+      "burst_duration_s": 5.559
+    },
+    {
+      "route": "api",
+      "limit_per_window": 100,
+      "requests_sent": 300,
+      "allowed": 100,
+      "rejected_429": 200,
+      "other_statuses": {},
+      "accuracy": 1.0,
+      "exact": true,
+      "429_with_retry_after": 200,
+      "limiter_backend": {
+        "redis": 300
+      },
+      "burst_duration_s": 1.859
+    }
+  ],
+  "data_integrity": {
+    "expected_new_url_rows": 18478,
+    "new_url_rows": 18478,
+    "duplicate_short_codes": 0,
+    "expected_new_click_rows": 73728,
+    "new_click_rows": 73728,
+    "click_counter_increase": 73728,
+    "urls_consistent": true,
+    "clicks_consistent": true
+  }
+}
