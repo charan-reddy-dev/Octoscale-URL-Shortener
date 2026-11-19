@@ -125,26 +125,23 @@ async def test_base_repository_get_all_and_delete(db_session):
 async def test_url_service_fallback_counter_initialization(db_session, mock_redis):
     repo = URLRepository(db_session)
     service = URLService(repo, mock_redis)
-    
-    if "url_id_counter" in mock_redis.store:
-        del mock_redis.store["url_id_counter"]
-        
+
+    await mock_redis.delete("url_id_counter")
+
     existing = URL(id=15000000, original_url="https://seeded.com", short_code="seed")
     await repo.create(existing)
     await db_session.commit()
-    
+
     url_rec, _ = await service.shorten_url("https://new-fallback.com")
     assert url_rec.id == 15000001
 
 @pytest.mark.asyncio
-async def test_redis_manager_lifecycle(mocker):
-    mock_redis_inst = mocker.MagicMock()
-    mock_redis_inst.close = mocker.AsyncMock()
-    mocker.patch("redis.asyncio.from_url", return_value=mock_redis_inst)
-    
+async def test_redis_manager_lifecycle():
     from app.redis import RedisManager
     manager = RedisManager()
     manager.initialize()
     assert manager.redis is not None
+    assert manager.redis.connection_pool.max_connections == 200
+    assert manager.redis.connection_pool.connection_kwargs["protocol"] == 2
     await manager.close()
 

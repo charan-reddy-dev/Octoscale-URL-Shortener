@@ -1,206 +1,257 @@
-# OctoScale: URL Shortener with Redis Caching and Rate Limiting
+# OctoScale: URL Shortener with Atomic Rate Limiting
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Charanloyal/octoscale-url-shortener)
+[![CI](https://github.com/charan-reddy-dev/Octoscale-URL-Shortener/actions/workflows/ci.yml/badge.svg)](https://github.com/charan-reddy-dev/Octoscale-URL-Shortener/actions/workflows/ci.yml)
 
-OctoScale is a URL shortening service built on FastAPI, PostgreSQL and Redis. Short codes come from a Redis atomic counter (`INCR`) encoded in Base62, redirects are served from a Redis cache with a PostgreSQL fallback, click analytics are written in a FastAPI background task, and a sliding-window rate limiter on Redis sorted sets protects the API. The code uses a layered structure (routes → service → repository) with structured JSON logging.
+OctoScale is a URL shortener built on FastAPI, PostgreSQL and Redis. Short codes come from an atomic Redis counter encoded in Base62. Redirects are served from a Redis cache with a PostgreSQL fallback, every redirect and API call passes an atomic sliding-window rate limiter (a Lua script on a Redis sorted set), and click analytics are buffered and written in batches. When Redis is down, redirects and rate limiting keep working instead of failing.
 
-A built-in dashboard lets users shorten links, copy them, and view click analytics for a code (a referrer breakdown chart and a table of recent clicks with a browser column parsed from the user agent).
+A built-in dashboard lets users shorten links, copy them, and view click analytics for a code: a referrer breakdown and a table of recent clicks.
 
-**Status:** working single-instance service with a mocked-Redis/SQLite test suite. It is designed with throughput in mind (cached redirect path, deferred analytics writes), but **no load test has been run yet, so no throughput or latency figures are claimed** (see [Performance](#performance)).
+- Live demo: https://octoscale-web.onrender.com (Render free tier; the first request after idle can take up to a minute)
+- API docs: https://octoscale-web.onrender.com/docs
+
+## Verified benchmark results
+
+Every number below is copied from [`benchmarks/results.json`](benchmarks/results.json), the raw output of [`benchmarks/load_test.py`](benchmarks/load_test.py) at commit `58e5618`, recorded on 2026-11-18.
+
+**Throughput and latency**
+
+| Scenario | Requests | Throughput | p50 | p95 | p99 | Max | Error rate |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Redirect `GET /{code}` (cached, 30 s) | 72,128 | **2,404.8 req/s** | 37.005 ms | 144.428 ms | 219.874 ms | 614.367 ms | 0 % (all 307) |
+| Create `POST /api/v1/shorten` (15 s) | 17,378 | **1,155.8 req/s** | 73.909 ms | 318.08 ms | 629.644 ms | 2,994.277 ms | 0 % (all 201) |
+
+Both scenarios ran at 126 concurrent keep-alive connections (6 load-generator processes × 21) spread over 20,000 simulated client IPs. Each redirect runs the rate-limit Lua script and a Redis cache lookup; each create runs the rate limiter, allocates an ID from the Redis counter and inserts a row into PostgreSQL.
+
+**Rate-limiter accuracy:** a burst of 3× the limit from a single client
+
+| Route | Limit per 60 s | Sent | Allowed | Rejected (429) | 429s with `Retry-After` | Exact |
+|---|---:|---:|---:|---:|---:|:---:|
+| Redirect | 600 | 1,800 | 600 | 1,200 | 1,200 | yes |
+| API | 100 | 300 | 100 | 200 | 200 | yes |
+
+All 2,100 burst decisions were made by the Redis backend (`X-RateLimit-Backend: redis`).
+
+**Data integrity:** checked against PostgreSQL after the run
+
+| Check | Expected | Actual |
+|---|---:|---:|
+| New URL rows (one per 201) | 18,478 | 18,478 |
+| Duplicate short codes | 0 | 0 |
+| New click rows (one per 307, written in batches) | 73,728 | 73,728 |
+| Increase of `urls.clicks` counters | 73,728 | 73,728 |
+
+**Environment:** Intel Core Ultra 5 235 (14 cores), 63.7 GB RAM, Windows 11, Python 3.14.7. The server ran 6 uvicorn workers against PostgreSQL 18.7 and Redis 5.0.14.1 (Windows port, persistence off), all on the same machine as the load generator. Settings: `LOG_LEVEL=warning`, `TRUST_PROXY_HEADERS=true`, default pool sizes.
+
+**Reading these numbers:**
+- Client, server, PostgreSQL and Redis shared one 14-core laptop, so the load generator competed with the server for CPU. Treat the results as a reproducible baseline for this code, not a production capacity figure.
+- p95/p99 vary between runs on the same machine. In trial runs the redirect p95 ranged from about 35 ms to 150 ms.
+- Python's HTTP client limits how much load one machine can generate.
+
+### Reproduce
+
+Start the stack (see [Quickstart](#quickstart)) with `TRUST_PROXY_HEADERS=true`, so each simulated client gets its own rate-limit bucket. Then run:
+
+```bash
+python benchmarks/load_test.py \
+  --base-url http://127.0.0.1:8000 \
+  --duration 30 --create-duration 15 \
+  --concurrency 128 --processes 6 --clients 20000 --urls 1000 \
+  --server-workers 6 --database "PostgreSQL 18.7 (local)" \
+  --redis-url redis://127.0.0.1:6379/0 \
+  --verify-db-url postgresql+asyncpg://postgres@127.0.0.1:5433/url_shortener \
+  --same-host \
+  --notes "uvicorn 6 workers, LOG_LEVEL=warning, TRUST_PROXY_HEADERS=true, Redis persistence off" \
+  --output benchmarks/results.json
+```
+
+The server for the recorded run was started with:
+
+```bash
+APP_ENV=production LOG_LEVEL=warning TRUST_PROXY_HEADERS=true \
+DATABASE_URL=postgresql+asyncpg://postgres@127.0.0.1:5433/url_shortener \
+REDIS_URL=redis://127.0.0.1:6379/0 \
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 6 --no-access-log
+```
+
+The script runs four phases:
+1. **Setup:** creates 1,000 links and warms the cache.
+2. **Redirect:** sustained redirect traffic.
+3. **Create:** sustained create traffic.
+4. **Limiter:** a 3× burst from one client against each rate-limited route.
+
+It writes every number, plus hardware metadata, the git commit and the command, to the output JSON. `--verify-db-url` is optional; when set, the script also checks that every successful response produced exactly one database row.
+
+### What the load test caught
+
+The first recorded run reported 0 HTTP errors but only 7,120 of 75,980 clicks in the database. Click batches flushed by different workers updated `urls` rows in different orders, PostgreSQL detected deadlocks, and the writer dropped those batches.
+
+The writer now increments counters in ascending id order, which makes deadlocks impossible, and it requeues a failed batch up to 3 times before counting it as dropped. The load test now verifies row counts, which is how the table above was produced.
 
 ---
-## Live Demo
 
-- Application: https://octoscale-web.onrender.com
-- API documentation: https://octoscale-web.onrender.com/docs
+## Architecture
 
-The demo runs on Render's free tier and may take a while to wake up or be unavailable (it returned HTTP 503 when last checked).
+```mermaid
+flowchart LR
+    C[Client] -->|HTTP| LB[Load balancer / reverse proxy]
+    LB --> W1[uvicorn worker 1]
+    LB --> Wn[uvicorn worker N]
+    subgraph Worker [Each FastAPI worker]
+        RL[Rate limiter<br/>EVALSHA sliding window<br/>memory fallback]
+        SVC[URL service<br/>cache-aside + Base62]
+        CR[Click recorder<br/>in-memory queue]
+    end
+    W1 --- Worker
+    RL -->|Lua script| R[(Redis<br/>rate-limit ZSETs<br/>code cache<br/>ID counter)]
+    SVC -->|GET / SET EX / INCR| R
+    SVC -->|pooled asyncpg| PG[(PostgreSQL<br/>urls, click_analytics)]
+    CR -->|batched UPDATE + bulk INSERT| PG
+```
 
-## What Is Implemented
-
-- Repository pattern with separate service and persistence layers
-- Redis-backed atomic identifier generation (`INCR` + Base62)
-- PostgreSQL fallback (`SELECT MAX(id)`) to re-seed the Redis counter if it is lost
-- Sliding-window rate limiting with Redis sorted sets (fails open if Redis is unavailable)
-- Click analytics recorded in a background task after the redirect is returned
-- Structured JSON logging with `structlog`
-- 20 automated tests (pytest, mocked Redis, in-memory SQLite); see [Testing and Coverage](#-testing-and-coverage)
-
-## Performance
-
-No benchmark has been run yet and no load-test script is committed, so this table is intentionally empty.
-
-| Environment | Concurrent users | Throughput | p95 latency |
-|---|---:|---:|---:|
-| Not yet measured | — | — | — |
-
-To produce real numbers, add a load-test script (for example Locust or k6) under `benchmarks/`, run it against `docker-compose up` on stated hardware, and commit the raw output alongside the table. Measure the cached redirect path (`GET /{short_code}`) and the create path (`POST /api/v1/shorten`) separately, and raise `RATE_LIMIT_PER_MINUTE` for the test, because the default of 100 requests/min per IP will otherwise return HTTP 429.
-
-
-## 🏗️ System Architecture & Data Flow
-
-OctoScale separates concerns through a classic layered OOP structure:
-- **Presentation Layer**: FastAPI API routes, custom middlewares, and HTML template responders.
-- **Service Layer (Business Logic)**: Manages Base62 hash-string calculations, rate limiting checks, cache coordination, and schedules background analytics logging.
-- **Data Layer (Repository Pattern)**: Encapsulates database actions through generic repositories to maximize extensibility.
-
-### Request Flow Diagram
+### Redirect path
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Client
-    participant API as FastAPI Router
-    participant Redis as Redis Cache
-    participant DB as PostgreSQL DB
-    participant BG as Background Task
+    participant API as FastAPI worker
+    participant Redis
+    participant DB as PostgreSQL
+    participant Q as Click queue
 
-    Client->>API: GET /{short_code} (Redirect Request)
-    API->>API: Apply Sliding Window Rate Limiter
-    alt Rate Limit Exceeded
-        API-->>Client: HTTP 429 Too Many Requests
-    else Allowed
+    Client->>API: GET /{short_code}
+    API->>Redis: EVALSHA sliding_window(key, limit, window, request_id)
+    alt over the limit
+        Redis-->>API: {0, 0, retry_after_ms}
+        API-->>Client: 429 + Retry-After + X-RateLimit-*
+    else allowed
+        Redis-->>API: {1, remaining, 0}
         API->>Redis: GET code:{short_code}
-        alt Cache Hit
-            Redis-->>API: Returns original_url
-        else Cache Miss
-            API->>DB: Query original URL by short_code
-            alt Not Found
-                DB-->>API: DB Exception (KeyError)
-                API-->>Client: Renders 404 Error page
-            else Found
-                DB-->>API: Returns url_record
-                API->>Redis: SETEX code:{short_code} (populate cache, 24h TTL)
-            end
+        alt cache miss
+            API->>DB: SELECT by short_code
+            API->>Redis: SET code / orig (EX 24h)
         end
-        API->>BG: Enqueue record_click() Task
-        API-->>Client: HTTP 307 Temporary Redirect
-        BG->>DB: Increment click count & Write click log
+        API->>Q: enqueue click (non-blocking)
+        API-->>Client: 307 Location: original URL
+        Q->>DB: every 0.5 s: UPDATE clicks (sorted ids) + bulk INSERT analytics
     end
 ```
 
+### Rate limiting
+
+[`app/rate_limit.py`](app/rate_limit.py) loads one Lua script with `register_script` and calls it with `EVALSHA`; the script is reloaded automatically if Redis restarts. Inside the script, atomically on the Redis server:
+1. Read the Redis clock (`TIME`), so all app instances share one clock.
+2. Drop entries older than the window (`ZREMRANGEBYSCORE`) and count the rest (`ZCARD`).
+3. If under the limit, add the request with a unique member (a UUID, so simultaneous requests never collapse into one entry) and set `PEXPIRE`. Otherwise return the time until the oldest entry leaves the window.
+
+Rejected requests are not recorded, so a client that keeps retrying regains access as soon as the window allows. Responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Backend`, and a 429 adds `Retry-After`.
+
+- **Separate limits:** `/api/v1/*` and redirects have their own per-client limits (`RATE_LIMIT_PER_MINUTE`, `REDIRECT_RATE_LIMIT_PER_MINUTE`).
+- **Client identity:** by default the client is the socket address. With `TRUST_PROXY_HEADERS=true` it is the first `X-Forwarded-For` address; enable that only behind a proxy you control.
+- **Fallback:** if Redis errors or times out (0.5 s socket timeout), a circuit breaker stops calling Redis for 5 s and an in-process sliding window with the same semantics takes over. Limits stay enforced, per worker process, instead of failing open.
+
+### Short codes
+
+IDs come from `INCR url_id_counter`, starting at 10,000,000, so codes are 4 Base62 characters until the counter passes 62⁴. If the counter key is missing (first start, or Redis lost its data), it is seeded from `MAX(id)` in PostgreSQL with `SET NX`. Concurrent first requests therefore cannot reset a counter that another request has already incremented; a test runs 25 concurrent allocations and checks they are all distinct.
+
+Custom codes are checked first and protected by the unique constraint: a race on the same code returns 400, not 500. If Redis is down, existing links still redirect from PostgreSQL, but creating a link returns `503` with `Retry-After`, because no ID can be allocated safely.
+
+### Click analytics
+
+Redirects put click events on an in-memory queue and return immediately. A writer per worker flushes up to 1,000 events every 0.5 s in one transaction:
+- one `executemany` UPDATE of the click counters, in ascending id order;
+- one bulk INSERT of the analytics rows.
+
+Writer stats (pending, written, retried, dropped) are reported by `GET /api/v1/health`.
+
+### Connection pooling
+
+- **Redis:** one shared `ConnectionPool` per worker (200 connections, 0.5 s timeouts, RESP2 so any Redis version works).
+- **PostgreSQL:** an asyncpg pool (20 + 10 overflow, `pre_ping`, 30-minute recycle).
+- **SQLite:** for local development, SQLite runs in WAL mode with a busy timeout.
+
 ---
 
-## ⚡ Key Architecture Highlights
+## Quickstart
 
-### 1. Counter-Based ID Generation
-Instead of random hashes (which need collision checks), OctoScale uses a **Redis atomic counter** (`INCR`) to generate sequential IDs.
-- These IDs are encoded into **Base62** strings (e.g. `10000001` becomes `P7Cv`), producing unique, short alphanumeric paths. The counter starts at 10,000,000, so generated codes are 4 characters until the counter passes 62⁴ (14,776,336).
-- **Fallback**: If the Redis counter key is missing (e.g. Redis was flushed or restarted without persistence), the service queries `SELECT MAX(id)` from PostgreSQL, seeds the Redis counter, and continues from there.
+### Docker Compose (app + PostgreSQL + Redis)
 
-### 2. Cached Redirects (Cache-Aside Reads, Cache Write on Create)
-- When a short URL is created, the mapping is written to PostgreSQL and then to Redis (24-hour TTL).
-- When a link is resolved, it reads from Redis first.
-- On a cache miss it falls back to PostgreSQL, populates the Redis cache with a 24-hour TTL, and returns the redirect.
-- To keep the redirect path short, **click tracking and analytics writes are deferred to FastAPI BackgroundTasks**: the redirect response is returned first and the database writes run afterwards in the same process.
-
-### 3. Sliding Window Rate Limiter
-Implemented via **Redis Sorted Sets (ZSET)**. Clients are limited (default: 100 requests/min per client IP, `RATE_LIMIT_PER_MINUTE`) using a sliding window (`zremrangebyscore`, `zadd`, `zcard` in one pipeline), which limits brute-force URL scraping and request floods from a single IP. If Redis is unreachable the limiter logs the error and lets the request through (fail-open).
-
----
-
-## 🛠️ Tech Stack & Observability
-- **Core**: Python 3.11+, FastAPI (Asynchronous API gateway)
-- **Database**: PostgreSQL (Persistent metadata and relational analytics)
-- **Object Relational Mapper**: SQLAlchemy 2.0 (Asyncpg driver)
-- **Caching**: Redis (Rate limiting, ID generator, and hot-path resolution cache)
-- **Containerization**: Docker & Docker Compose (Multi-stage builds)
-- **Observability**: Structured logging with `structlog` (JSON output when `APP_ENV=production`), suitable for log aggregators
-- **Testing**: Pytest with `pytest-asyncio`, `pytest-cov` and `pytest-mock` (in-process mock Redis and an in-memory SQLite database)
-
----
-
-## ⚙️ Running Locally
-
-### Prerequisites
-- Docker and Docker Compose installed
-
-### Start the Service (One Command)
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
-This launches:
-1. **FastAPI Web Service** at `http://localhost:8000`
-2. **PostgreSQL 15** database at `localhost:5432`
-3. **Redis 7** cache at `localhost:6379`
 
-The FastAPI startup lifecycle automatically creates the required PostgreSQL database tables.
+- App and dashboard: http://localhost:8000
+- API docs: http://localhost:8000/docs
+- Health: http://localhost:8000/api/v1/health
+
+Compose runs 2 uvicorn workers (`WEB_CONCURRENCY`), PostgreSQL 16 and Redis 7 with append-only persistence, and health-checks all three.
+
+### Local, without Docker
+
+Requires Python 3.12+ and a running Redis.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+export DATABASE_URL=sqlite+aiosqlite:///./octoscale.sqlite3   # or a postgresql:// URL
+export REDIS_URL=redis://127.0.0.1:6379/0
+uvicorn app.main:app --reload
+```
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | local PostgreSQL | `postgresql://` URLs are rewritten to `postgresql+asyncpg://` |
+| `REDIS_URL` | `redis://localhost:6379/0` | Cache, ID counter and rate-limit windows |
+| `RATE_LIMIT_PER_MINUTE` | `100` | Per-client limit for `/api/v1/*` |
+| `REDIRECT_RATE_LIMIT_PER_MINUTE` | `600` | Per-client limit for `GET /{code}` |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding-window length |
+| `TRUST_PROXY_HEADERS` | `false` | Use `X-Forwarded-For` as client identity |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `20` / `10` | PostgreSQL pool per worker |
+| `REDIS_MAX_CONNECTIONS` | `200` | Redis pool per worker |
+| `REDIS_SOCKET_TIMEOUT` | `0.5` | Seconds before a Redis call counts as failed |
+| `CLICK_FLUSH_INTERVAL_SECONDS` / `CLICK_BATCH_SIZE` | `0.5` / `1000` | Click writer batching |
+| `LOG_LEVEL` | `info` | `warning` drops per-request access logs |
+| `WEB_CONCURRENCY` | `1` | uvicorn workers in the Docker image |
 
 ---
 
-## 🧪 Testing and Coverage
+## Tests
 
-The test suite uses `pytest` with an in-process mock of Redis (`tests/conftest.py`) and an in-memory SQLite database via the async `aiosqlite` dialect, so it needs neither Redis nor PostgreSQL. Because of this, it does not exercise real Redis semantics (TTL expiry, pipelines/transactions) or PostgreSQL-specific behaviour.
-
-### Run Tests locally
 ```bash
-# Set up virtual environment
-py -m venv .venv
-.venv\Scripts\activate
-
-# Install dependencies (C++ compiler not required for SQLite tests)
-pip install fastapi uvicorn pydantic-settings "sqlalchemy[asyncio]" aiosqlite redis structlog jinja2 pytest pytest-asyncio pytest-cov httpx pytest-mock
-
-# Run test suite with coverage
-pytest --cov=app --cov-report=term-missing tests/
+pytest --cov=app tests/
 ```
 
-### Coverage Report
-Output below was recorded by the author (20 test functions exist in `tests/`); it is not generated in CI, so re-run the command above to reproduce it.
-```
-=============================== tests coverage ================================
-Name                                 Stmts   Miss  Cover   Missing
-------------------------------------------------------------------
-app\__init__.py                          0      0   100%
-app\api\__init__.py                      0      0   100%
-app\api\dependencies.py                 34      4    88%   27, 50-51, 57
-app\api\v1\__init__.py                   2      0   100%
-app\api\v1\endpoints.py                 45      2    96%   52-53
-app\config.py                           11      0   100%
-app\database.py                         21     10    52%   10-11, 34-42
-app\logger.py                           13      1    92%   18
-app\main.py                             60     18    70%   20-39, 73-82, 94
-app\models\__init__.py                   3      0   100%
-app\models\url.py                       22      0   100%
-app\redis.py                            26      8    69%   19-21, 30-32, 37-38
-app\repositories\__init__.py             2      0   100%
-app\repositories\base.py                26      0   100%
-app\repositories\url_repository.py      21      0   100%
-app\schemas\__init__.py                  2      0   100%
-app\schemas\url.py                      29      3    90%   14, 25, 27
-app\services\__init__.py                 2      0   100%
-app\services\url_service.py             89     10    89%   57, 82-85, 121-125, 142
-------------------------------------------------------------------
-TOTAL                                  408     56    86%
-======================== 20 passed, 1 warning in 0.78s ========================
-```
+36 tests, 87 % line coverage, run in CI on every push.
+
+- **Redis:** the suite uses [fakeredis](https://github.com/cunla/fakeredis-py) with Lua support, so the real rate-limit script, sorted sets and TTLs are exercised. SQLite in memory replaces PostgreSQL.
+- **Rate limiter:**
+  - exact limits, and remaining/`Retry-After` headers;
+  - rejected requests are not counted;
+  - a concurrent burst of 80 requests against a limit of 50 allows exactly 50;
+  - separate redirect and API buckets, and trusted-proxy client identity;
+  - fallback to memory when Redis fails.
+- **Short codes:** race-free counter seeding.
+- **Redis outage:** redirects keep working and creation returns 503.
+- **Click writer:** batched writes, retry after a failed batch, and drop after 3 attempts.
 
 ---
 
 ## Deployment
 
-The service is a single Docker image (`Dockerfile`) that needs a PostgreSQL database and a Redis instance, configured through `DATABASE_URL`, `REDIS_URL`, `BASE_URL` and `APP_ENV` (see `.env.example`). A `postgresql://` URL is rewritten to the `postgresql+asyncpg://` driver automatically.
+The service is a single Docker image that needs PostgreSQL and Redis (`DATABASE_URL`, `REDIS_URL`, `BASE_URL`, `APP_ENV`; see `.env.example`). Set `WEB_CONCURRENCY` for the number of workers.
 
-### Render (Blueprint)
-The repository includes a `render.yaml` Blueprint that defines the web service (Docker), a Render Key Value (Redis-compatible) instance and a PostgreSQL database, all on the free plan. Create a new **Blueprint** on Render, point it at this repository, and update `BASE_URL` in `render.yaml` to your service URL.
-
-### Railway
-1. Create a project from this GitHub repository; Railway builds the `Dockerfile`.
-2. Add PostgreSQL and Redis services from the dashboard.
-3. Set the environment variables on the web service:
-   - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`
-   - `REDIS_URL` = `${{Redis.REDIS_URL}}`
-   - `BASE_URL` = `https://<your-railway-app-name>.up.railway.app`
-   - `APP_ENV` = `production`
-
----
+- **Render:** `render.yaml` defines the web service, a Key Value (Redis-compatible) instance and PostgreSQL. Create a Blueprint from this repository and set `BASE_URL`. Render terminates TLS at its proxy, so set `TRUST_PROXY_HEADERS=true` for per-client rate limits.
+- **Railway:** build from the `Dockerfile`, add PostgreSQL and Redis, and set `DATABASE_URL=${{Postgres.DATABASE_URL}}`, `REDIS_URL=${{Redis.REDIS_URL}}`, `BASE_URL` and `APP_ENV=production`.
 
 ## Limitations
 
-- **No load test or benchmark yet** – throughput and latency are unmeasured.
-- **Single instance** – background click recording runs in the web process (FastAPI `BackgroundTasks`), not a durable queue; clicks in flight are lost if the process stops.
-- **Schema management** – tables are created with `create_all` on startup; there are no migrations (e.g. Alembic).
-- **Analytics endpoint** loads all click rows for a URL and sorts them in memory before returning the latest 100, which will slow down for very popular links.
-- **Custom codes vs generated codes** – a custom code is not reserved against future counter values, so a custom 4-character code could later collide with a generated one (rejected by the unique constraint on `short_code`).
-- **Client IP behind a proxy** – the rate limiter keys on `request.client.host`; behind a reverse proxy (e.g. Render) uvicorn must be configured to trust forwarded headers, otherwise clients may share one limit.
-- **Tests use mocks** – Redis is mocked and SQLite replaces PostgreSQL; there is no CI workflow or integration test against real services.
+- **Click durability:** clicks wait in memory for up to 0.5 s; a crash loses that buffer. A durable stream such as Redis Streams or Kafka would close the gap.
+- **Fallback limits:** the in-memory limiter applies per worker process, so during a Redis outage the effective limit is the configured limit × number of workers.
+- **Schema:** tables are created with `create_all` at startup (retried when several workers race); there are no Alembic migrations.
+- **Analytics endpoint:** it loads all click rows for a link and sorts them in memory, which slows down for very popular links.
+- **Custom codes:** custom codes are not reserved against future counter values, so a 4-character custom code could later collide with a generated one. The unique constraint rejects it.
+- **Benchmark scope:** the recorded run used a single machine and the Windows port of Redis 5. There is no benchmark yet against the Docker Compose stack or across multiple hosts.
